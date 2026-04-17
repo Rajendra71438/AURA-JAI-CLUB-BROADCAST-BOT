@@ -2,7 +2,8 @@
 bot.py — Telegram Bot with full panel UI and extended admin controls.
 - Auto‑approve toggle for join requests.
 - Hierarchical roles: Superadmin → Admin → Subadmin.
-- Background broadcasting — shows "done" instantly while working in background.
+- Background broadcast with zero delay.
+- Minimal logging output.
 """
 
 import asyncio
@@ -43,19 +44,35 @@ BOT_TOKEN:       str = os.getenv("BOT_TOKEN", "")
 SOURCE_CHAT_ID:  int = int(os.getenv("SOURCE_CHAT_ID", "0"))
 ADMIN_ID:        int = int(os.getenv("ADMIN_ID", "0"))
 
-BROADCAST_DELAY: float = 0.5
+BROADCAST_DELAY: float = 0.0   # No delay between messages
 MAX_RETRIES:     int   = 2
 DB_PATH:         str   = "bot.db"
 
 if not BOT_TOKEN:      raise ValueError("BOT_TOKEN not set in .env")
 if not ADMIN_ID:       raise ValueError("ADMIN_ID not set in .env")
 
+# ══════════════════════════════════════════════
+# MINIMAL LOGGING CONFIGURATION
+# ══════════════════════════════════════════════
+
+# Only show WARNING and above from most loggers
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
-    level=logging.INFO,
+    level=logging.WARNING,   # Only warnings and errors by default
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Silence noisy libraries completely
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+# But keep INFO for our own logger so we can see "Bot started"
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Optional: also silence the default asyncio debug logs
+logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
 # ══════════════════════════════════════════════
@@ -631,18 +648,18 @@ async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ══════════════════════════════════════════════
-# BACKGROUND BROADCAST
+# BACKGROUND BROADCAST TASK (zero delay)
 # ══════════════════════════════════════════════
 
-async def background_broadcast(source_msg, bot, text: str = None) -> None:
-    """Run broadcast in background without blocking the admin."""
+async def background_broadcast(
+    source_msg,           # original message to copy (if no text)
+    bot,                  # bot instance
+    admin_chat_id: int,   # where to send final report
+    text: str = None      # optional text instead of copying
+) -> None:
+    """Run broadcast in background and report completion to admin."""
     sent = blocked = failed = 0
-    user_ids = await run(db_all_user_ids)
-    total_users = len(user_ids)
-    
-    logger.info("Background broadcast started to %d users", total_users)
-    
-    for uid in user_ids:
+    for uid in await run(db_all_user_ids):
         for attempt in range(MAX_RETRIES + 1):
             try:
                 if text:
@@ -664,12 +681,19 @@ async def background_broadcast(source_msg, bot, text: str = None) -> None:
                 logger.exception("Unexpected error for %s: %s", uid, e)
                 failed += 1
                 break
-        await asyncio.sleep(BROADCAST_DELAY)
-    
-    logger.info(
-        "Background broadcast completed. Sent: %d, Blocked: %d, Failed: %d (Total: %d)",
-        sent, blocked, failed, total_users
+        # No delay (BROADCAST_DELAY = 0)
+
+    # Notify admin about completion
+    report = (
+        f"✅ *Broadcast completed*\n\n"
+        f"📤 Sent: `{sent}`\n"
+        f"🚫 Blocked: `{blocked}`\n"
+        f"❌ Failed: `{failed}`"
     )
+    try:
+        await bot.send_message(chat_id=admin_chat_id, text=report, parse_mode="Markdown")
+    except Exception as e:
+        logger.error("Failed to send broadcast report to admin %s: %s", admin_chat_id, e)
 
 
 # ══════════════════════════════════════════════
@@ -854,11 +878,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await open_panel(update, uid, "⛔ You don't have permission to broadcast.")
             return
         await run(db_clear_state, uid)
-        
-        # Start background broadcast task and show "done" immediately
-        asyncio.create_task(background_broadcast(msg, context.bot))
-        
-        await open_panel(update, uid, "✅ Broadcast done — sent to all users successfully.")
+
+        # Immediate confirmation
+        status_msg = await msg.reply_text("📤 Broadcast started in background. You'll be notified when done.")
+
+        # Launch background task
+        asyncio.create_task(
+            background_broadcast(
+                source_msg=msg,
+                bot=context.bot,
+                admin_chat_id=uid,
+                text=None  # copy message as is
+            )
+        )
+
+        # Return to panel without waiting
+        await open_panel(update, uid, "Broadcast is running in the background.")
         return
 
     # ── State: awaiting add admin (superadmin only) ──
@@ -919,4 +954,473 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # ── State: awaiting remove subadmin (admin or superadmin) ──
     if action == "awaiting_remove_subadmin":
-        if not (is_main_admin(uid
+        if not (is_main_admin(uid) or db_is_admin(uid)):
+            await open_panel(update, uid, "⛔ You don't have permission to remove subadmins.")
+            return
+        await run(db_clear_state, uid)
+        try:
+            tid = int(text)
+            if tid == ADMIN_ID:
+                reply = "ℹ️ The main admin cannot be removed."
+            else:
+                ok = await run(db_remove_subadmin, tid)
+                reply = f"✅ Subadmin `{tid}` removed." if ok else f"ℹ️ `{tid}` was not a subadmin."
+        except ValueError:
+            reply = "❌ Invalid ID."
+        await open_panel(update, uid, reply)
+        return
+
+    # ── State: awaiting add message ──
+    if action == "awaiting_addmsg":
+        if not db_has_perm(uid, "can_manage_seq"):
+            await open_panel(update, uid, "⛔ You don't have permission to manage sequence.")
+            return
+        await run(db_clear_state, uid)
+        parts = text.split()
+        try:
+            mid, pos = int(parts[0]), int(parts[1])
+            if pos < 1:
+                reply = "❌ Position must be ≥ 1."
+            else:
+                ok    = await run(db_add_message, mid, pos)
+                reply = (
+                    f"✅ Message `{mid}` added at position `{pos}`."
+                    if ok else
+                    "❌ Duplicate position — use 🔀 Reorder to move an existing entry first."
+                )
+        except (ValueError, IndexError):
+            reply = "❌ Invalid input. Expected: `<message_id> <position>` (two numbers)."
+        await _open_sequence_panel(update, uid, reply)
+        return
+
+    # ── State: awaiting remove message ──
+    if action == "awaiting_removemsg":
+        if not db_has_perm(uid, "can_manage_seq"):
+            await open_panel(update, uid, "⛔ You don't have permission to manage sequence.")
+            return
+        await run(db_clear_state, uid)
+        try:
+            mid   = int(text)
+            ok    = await run(db_remove_message, mid)
+            reply = f"✅ Message `{mid}` removed." if ok else f"ℹ️ Message ID `{mid}` not found."
+        except ValueError:
+            reply = "❌ Invalid ID."
+        await _open_sequence_panel(update, uid, reply)
+        return
+
+    # ── State: awaiting reorder message ──
+    if action == "awaiting_reordermsg":
+        if not db_has_perm(uid, "can_manage_seq"):
+            await open_panel(update, uid, "⛔ You don't have permission to manage sequence.")
+            return
+        await run(db_clear_state, uid)
+        parts = text.split()
+        try:
+            mid, pos = int(parts[0]), int(parts[1])
+            ok    = await run(db_reorder_message, mid, pos)
+            reply = (
+                f"✅ Message `{mid}` moved to position `{pos}`."
+                if ok else
+                f"ℹ️ Message ID `{mid}` not found."
+            )
+        except (ValueError, IndexError):
+            reply = "❌ Invalid input. Expected: `<message_id> <new_position>` (two numbers)."
+        await _open_sequence_panel(update, uid, reply)
+        return
+
+    # ── State: awaiting change source ──
+    if action == "awaiting_change_source":
+        if not db_has_perm(uid, "can_change_source"):
+            await open_panel(update, uid, "⛔ You don't have permission to change source channel.")
+            return
+        await run(db_clear_state, uid)
+        try:
+            new_id = int(text)
+            await run(db_set_source_chat_id, new_id)
+            reply = f"✅ Source channel updated to `{new_id}`."
+        except ValueError:
+            reply = "❌ Invalid chat ID."
+        await open_panel(update, uid, reply)
+        return
+
+    # ── State: awaiting set post button ──
+    if action == "awaiting_set_post":
+        if not db_has_perm(uid, "can_set_post_button"):
+            await open_panel(update, uid, "⛔ You don't have permission to set post button.")
+            return
+        await run(db_clear_state, uid)
+        parts = text.split("|")
+        msg_text = parts[0].strip()
+        btn_text = parts[1].strip() if len(parts) > 1 else ""
+        btn_url  = parts[2].strip() if len(parts) > 2 else ""
+        await run(db_set_post_sequence, msg_text, btn_text, btn_url)
+        reply = "✅ Post‑sequence message updated.\n"
+        if not btn_text or not btn_url:
+            reply += "ℹ️ Button has been removed (or left empty)."
+        await open_panel(update, uid, reply)
+        return
+
+    # ── State: awaiting remove post button ──
+    if action == "awaiting_remove_post_button":
+        if not db_has_perm(uid, "can_set_post_button"):
+            await open_panel(update, uid, "⛔ You don't have permission to modify the post button.")
+            return
+        await run(db_clear_state, uid)
+        if text.lower() != "yes":
+            await open_panel(update, uid, "↩️ Removal cancelled.")
+            return
+        current = await run(db_get_post_sequence)
+        await run(db_set_post_sequence, current.get("message_text", ""), "", "")
+        await open_panel(update, uid, "✅ Post button has been removed.")
+        return
+
+    # ── Button: Broadcast ──
+    if text == "📢 Broadcast":
+        if not db_has_perm(uid, "can_broadcast"):
+            await msg.reply_text("⛔ You don't have permission to broadcast.")
+            return
+        await run(db_set_state, uid, "awaiting_broadcast")
+        await msg.reply_text(
+            "📝 Send the message you want to broadcast now.\n"
+            "_(Supports text, photo, video, document — any format)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Button: Stats ──
+    if text == "📊 Stats":
+        if not db_has_perm(uid, "can_stats"):
+            await msg.reply_text("⛔ You don't have permission to view stats.")
+            return
+        total = await run(db_total_users)
+        daily = await run(db_daily_users)
+        pending = len(await run(db_get_pending_requests))
+        auto = "ON ✅" if await run(db_get_auto_approve) else "OFF ❌"
+        await msg.reply_text(
+            "📊 *Bot Statistics*\n\n"
+            f"👥 Total users:       `{total}`\n"
+            f"🗓 Today's new users: `{daily}`\n"
+            f"⏳ Pending approvals: `{pending}`\n"
+            f"🔄 Auto‑approve:      `{auto}`",
+            parse_mode="Markdown",
+            reply_markup=staff_kb(uid),
+            )
+        return
+
+    # ── Button: Admins (superadmin only) ──
+    if text == "👑 Admins" and is_main_admin(uid):
+        rows = await run(db_list_admins, "admin")
+        if rows:
+            listing = "\n".join(f"• `{r['user_id']}` (Admin)" for r in rows)
+        else:
+            listing = "_No admins._"
+        await msg.reply_text(
+            f"👑 *Admin Management*\n\n{listing}\n\n"
+            "Use buttons below to add/remove admins.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup(
+                [["➕ Add Admin", "➖ Remove Admin"], ["🔙 Back to Panel"]],
+                resize_keyboard=True
+            )
+        )
+        return
+
+    if text == "➕ Add Admin" and is_main_admin(uid):
+        await run(db_set_state, uid, "awaiting_add_admin")
+        await msg.reply_text(
+            "👑 Send the *Telegram user ID* of the person to add as Admin:",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    if text == "➖ Remove Admin" and is_main_admin(uid):
+        rows = await run(db_list_admins, "admin")
+        if not rows:
+            await msg.reply_text("ℹ️ No admins to remove.", reply_markup=admin_panel_kb())
+            return
+        listing = "\n".join(f"• `{r['user_id']}`" for r in rows)
+        await run(db_set_state, uid, "awaiting_remove_admin")
+        await msg.reply_text(
+            f"🟡 *Current Admins:*\n{listing}\n\n"
+            "Send the *user ID* to remove:",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Button: Subadmins (superadmin or admin) ──
+    if text == "👥 Subadmins":
+        if not (is_main_admin(uid) or db_is_admin(uid)):
+            await msg.reply_text("⛔ You don't have permission to manage subadmins.")
+            return
+        # Show only subadmins (role='subadmin') to admin, all subadmins to superadmin
+        if is_main_admin(uid):
+            rows = await run(db_list_admins)  # all
+            listing = "\n".join(f"• `{r['user_id']}` ({r['role'].capitalize()})" for r in rows)
+        else:
+            rows = await run(db_list_admins, "subadmin")
+            listing = "\n".join(f"• `{r['user_id']}`" for r in rows) if rows else "_No subadmins._"
+        await msg.reply_text(
+            f"👥 *Subadmin Management*\n\n{listing}\n\n"
+            "Use buttons below to add/remove subadmins.",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardMarkup(
+                [["➕ Add Subadmin", "➖ Remove Subadmin"], ["🔙 Back to Panel"]],
+                resize_keyboard=True
+            )
+        )
+        return
+
+    if text == "➕ Add Subadmin":
+        if not (is_main_admin(uid) or db_is_admin(uid)):
+            await msg.reply_text("⛔ You don't have permission to add subadmins.")
+            return
+        await run(db_set_state, uid, "awaiting_add_subadmin")
+        await msg.reply_text(
+            "👤 Send the *Telegram user ID* of the person to add as Subadmin:",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    if text == "➖ Remove Subadmin":
+        if not (is_main_admin(uid) or db_is_admin(uid)):
+            await msg.reply_text("⛔ You don't have permission to remove subadmins.")
+            return
+        if is_main_admin(uid):
+            rows = await run(db_list_admins)  # all
+        else:
+            rows = await run(db_list_admins, "subadmin")
+        if not rows:
+            await msg.reply_text("ℹ️ No subadmins to remove.", reply_markup=staff_kb(uid))
+            return
+        listing = "\n".join(f"• `{r['user_id']}`" for r in rows)
+        await run(db_set_state, uid, "awaiting_remove_subadmin")
+        await msg.reply_text(
+            f"🟡 *Current Subadmins:*\n{listing}\n\n"
+            "Send the *user ID* to remove:",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Button: Approve All Requests (main admin only) ──
+    if text == "✅ Approve All Requests" and is_main_admin(uid):
+        pending = await run(db_get_pending_requests)
+        if not pending:
+            await msg.reply_text("ℹ️ No pending join requests.", reply_markup=admin_panel_kb())
+            return
+        status = await msg.reply_text(f"⏳ Approving {len(pending)} requests…")
+        approved = 0
+        for req in pending:
+            try:
+                await context.bot.approve_chat_join_request(
+                    chat_id=req["chat_id"],
+                    user_id=req["user_id"]
+                )
+                approved += 1
+            except Exception as e:
+                logger.error("Failed to approve %s in %s: %s", req["user_id"], req["chat_id"], e)
+            await asyncio.sleep(0.1)
+        await run(db_clear_pending_requests)
+        await status.edit_text(f"✅ Approved {approved} out of {len(pending)} requests.")
+        await open_panel(update, uid)
+        return
+
+    # ── Button: Change Source Channel ──
+    if text == "📡 Change Source Channel":
+        if not db_has_perm(uid, "can_change_source"):
+            await msg.reply_text("⛔ You don't have permission to change source channel.")
+            return
+        current = await run(db_get_source_chat_id)
+        await run(db_set_state, uid, "awaiting_change_source")
+        await msg.reply_text(
+            f"Current source channel ID: `{current}`\n\n"
+            "Send the new *channel ID* (numeric):",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Button: Set Post Button ──
+    if text == "🔘 Set Post Button":
+        if not db_has_perm(uid, "can_set_post_button"):
+            await msg.reply_text("⛔ You don't have permission to set post button.")
+            return
+        current = await run(db_get_post_sequence)
+        info = f"Current: `{current.get('message_text','')}`"
+        if current.get('button_text'):
+            info += f" | Button: `{current['button_text']}` → `{current['button_url']}`"
+        await run(db_set_state, uid, "awaiting_set_post")
+        await msg.reply_text(
+            f"{info}\n\n"
+            "Send the new configuration in the format:\n"
+            "`Message text | Button text | Button URL`\n"
+            "_(Button text and URL are optional; omit to remove button)_\n\n"
+            "Example with button:\n"
+            "`Thanks for joining! | Visit site | https://example.com`\n\n"
+            "Example without button:\n"
+            "`Thanks for joining!`",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Button: Remove Post Button ──
+    if text == "🗑 Remove Post Button":
+        if not db_has_perm(uid, "can_set_post_button"):
+            await msg.reply_text("⛔ You don't have permission to modify the post button.")
+            return
+        current = await run(db_get_post_sequence)
+        info = f"Current message: `{current.get('message_text','')}`"
+        if current.get('button_text'):
+            info += f"\nCurrent button: `{current['button_text']}` → `{current['button_url']}`"
+        await run(db_set_state, uid, "awaiting_remove_post_button")
+        await msg.reply_text(
+            f"{info}\n\n"
+            "Are you sure you want to *remove the button*?\n"
+            "Type `yes` to confirm, or `❌ Cancel` to abort.",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Button: Auto‑Approve Toggle (superadmin only) ──
+    if text.startswith("🔄 Auto‑Approve:") and is_main_admin(uid):
+        current = await run(db_get_auto_approve)
+        new_val = not current
+        await run(db_set_auto_approve, new_val)
+        await open_panel(update, uid, f"🔄 Auto‑approve is now {'ON ✅' if new_val else 'OFF ❌'}")
+        return
+
+    # ── Button: Subadmin Permissions (main admin only) ──
+    if text == "⚙️ Subadmin Permissions" and is_main_admin(uid):
+        subs = await run(db_list_admins)
+        if not subs:
+            await msg.reply_text("ℹ️ No subadmins to configure.", reply_markup=admin_panel_kb())
+            return
+
+        keyboard = []
+        for sub in subs:
+            sid = sub["user_id"]
+            role = sub["role"]
+            keyboard.append([InlineKeyboardButton(f"👤 {sid} ({role.upper()})", callback_data=f"perm_sub_{sid}")])
+        keyboard.append([InlineKeyboardButton("🔙 Close", callback_data="perm_close")])
+
+        await msg.reply_text(
+            "⚙️ *Select a subadmin to manage permissions:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    # ── Button: Message Sequence ──
+    if text == "📨 Message Sequence":
+        if not db_has_perm(uid, "can_manage_seq"):
+            await msg.reply_text("⛔ You don't have permission to manage sequence.")
+            return
+        await _open_sequence_panel(update, uid)
+        return
+
+    # ── Sequence sub‑panel: Add Message ──
+    if text == "➕ Add Message" and db_has_perm(uid, "can_manage_seq"):
+        await run(db_set_state, uid, "awaiting_addmsg")
+        await msg.reply_text(
+            "📩 Send the *message ID* and *position* separated by a space.\n\n"
+            "Example: `101 1`\n"
+            "_(This copies message 101 from source channel at position 1)_",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Sequence sub‑panel: Remove Message ──
+    if text == "➖ Remove Message" and db_has_perm(uid, "can_manage_seq"):
+        rows = await run(db_get_messages)
+        if not rows:
+            await _open_sequence_panel(update, uid, "ℹ️ Sequence is empty.")
+            return
+        listing = "\n".join(f"  `{r['position']}.` msg\\_id `{r['message_id']}`" for r in rows)
+        await run(db_set_state, uid, "awaiting_removemsg")
+        await msg.reply_text(
+            f"📋 *Current sequence:*\n{listing}\n\n"
+            "Send the *message ID* to remove:",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Sequence sub‑panel: Reorder Message ──
+    if text == "🔀 Reorder Message" and db_has_perm(uid, "can_manage_seq"):
+        rows = await run(db_get_messages)
+        if not rows:
+            await _open_sequence_panel(update, uid, "ℹ️ Sequence is empty.")
+            return
+        listing = "\n".join(f"  `{r['position']}.` msg\\_id `{r['message_id']}`" for r in rows)
+        await run(db_set_state, uid, "awaiting_reordermsg")
+        await msg.reply_text(
+            f"📋 *Current sequence:*\n{listing}\n\n"
+            "Send *message\\_id* and *new\\_position* separated by a space.\n"
+            "Example: `101 3`",
+            parse_mode="Markdown",
+            reply_markup=cancel_kb(),
+        )
+        return
+
+    # ── Sequence sub‑panel: List Messages ──
+    if text == "📄 List Messages" and db_has_perm(uid, "can_manage_seq"):
+        rows = await run(db_get_messages)
+        if rows:
+            body = "\n".join(f"  `{r['position']}.` msg\\_id `{r['message_id']}`" for r in rows)
+        else:
+            body = "_Sequence is empty._"
+        await msg.reply_text(
+            f"📋 *Message Sequence*\n\n{body}",
+            parse_mode="Markdown",
+            reply_markup=sequence_panel_kb(),
+        )
+        return
+
+    # ── Sequence sub‑panel: Back to Panel ──
+    if text == "🔙 Back to Panel":
+        await open_panel(update, uid)
+        return
+
+
+async def _open_sequence_panel(update: Update, uid: int, note: str = "") -> None:
+    text = (f"{note}\n\n📨 *Message Sequence Panel*" if note else "📨 *Message Sequence Panel*")
+    await update.message.reply_text(
+        text.strip(), parse_mode="Markdown", reply_markup=sequence_panel_kb()
+    )
+
+
+# ══════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════
+
+def main() -> None:
+    init_db()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(ChatJoinRequestHandler(on_join_request))
+    app.add_handler(CallbackQueryHandler(cb_stats, pattern="^stats$"))
+
+    # Callback handlers for subadmin permissions UI
+    app.add_handler(CallbackQueryHandler(subadmin_list_callback, pattern="^perm_list$"))
+    app.add_handler(CallbackQueryHandler(subadmin_perm_menu_callback, pattern="^perm_sub_"))
+    app.add_handler(CallbackQueryHandler(perm_toggle_callback, pattern="^perm_toggle_"))
+    app.add_handler(CallbackQueryHandler(perm_close_callback, pattern="^perm_close$"))
+
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_message))
+
+    logger.info("Bot started — polling…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
