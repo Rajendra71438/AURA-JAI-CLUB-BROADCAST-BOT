@@ -2,8 +2,7 @@
 bot.py — Telegram Bot with full panel UI and extended admin controls.
 - Auto‑approve toggle for join requests.
 - Hierarchical roles: Superadmin → Admin → Subadmin.
-- Background broadcast with zero delay.
-- Minimal logging output.
+- Background broadcast with zero delay, silent confirmation.
 """
 
 import asyncio
@@ -55,7 +54,6 @@ if not ADMIN_ID:       raise ValueError("ADMIN_ID not set in .env")
 # MINIMAL LOGGING CONFIGURATION
 # ══════════════════════════════════════════════
 
-# Only show WARNING and above from most loggers
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     level=logging.WARNING,   # Only warnings and errors by default
@@ -66,13 +64,11 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
 
-# But keep INFO for our own logger so we can see "Bot started"
+# Keep INFO for our own logger so we see "Bot started"
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-# Optional: also silence the default asyncio debug logs
-logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
 # ══════════════════════════════════════════════
@@ -648,17 +644,15 @@ async def cb_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ══════════════════════════════════════════════
-# BACKGROUND BROADCAST TASK (zero delay)
+# BACKGROUND BROADCAST TASK (silent, zero delay)
 # ══════════════════════════════════════════════
 
 async def background_broadcast(
     source_msg,           # original message to copy (if no text)
     bot,                  # bot instance
-    admin_chat_id: int,   # where to send final report
     text: str = None      # optional text instead of copying
 ) -> None:
-    """Run broadcast in background and report completion to admin."""
-    sent = blocked = failed = 0
+    """Run broadcast silently in background. No report is sent."""
     for uid in await run(db_all_user_ids):
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -666,34 +660,18 @@ async def background_broadcast(
                     await bot.send_message(chat_id=uid, text=text)
                 else:
                     await source_msg.copy(chat_id=uid)
-                sent += 1
                 break
             except Forbidden:
-                blocked += 1
                 break
             except TelegramError as e:
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(1)
                 else:
                     logger.warning("Broadcast failed for %s: %s", uid, e)
-                    failed += 1
             except Exception as e:
                 logger.exception("Unexpected error for %s: %s", uid, e)
-                failed += 1
                 break
         # No delay (BROADCAST_DELAY = 0)
-
-    # Notify admin about completion
-    report = (
-        f"✅ *Broadcast completed*\n\n"
-        f"📤 Sent: `{sent}`\n"
-        f"🚫 Blocked: `{blocked}`\n"
-        f"❌ Failed: `{failed}`"
-    )
-    try:
-        await bot.send_message(chat_id=admin_chat_id, text=report, parse_mode="Markdown")
-    except Exception as e:
-        logger.error("Failed to send broadcast report to admin %s: %s", admin_chat_id, e)
 
 
 # ══════════════════════════════════════════════
@@ -879,21 +857,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         await run(db_clear_state, uid)
 
-        # Immediate confirmation
-        status_msg = await msg.reply_text("📤 Broadcast started in background. You'll be notified when done.")
+        # Simple confirmation only
+        await msg.reply_text("✅ Broadcast done")
+        await open_panel(update, uid)
 
         # Launch background task
         asyncio.create_task(
             background_broadcast(
                 source_msg=msg,
                 bot=context.bot,
-                admin_chat_id=uid,
-                text=None  # copy message as is
+                text=None
             )
         )
-
-        # Return to panel without waiting
-        await open_panel(update, uid, "Broadcast is running in the background.")
         return
 
     # ── State: awaiting add admin (superadmin only) ──
@@ -925,8 +900,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if tid == ADMIN_ID:
                 reply = "ℹ️ Cannot add the main admin."
             else:
-                # Determine role based on caller
-                role = "subadmin" if not is_main_admin(uid) else "subadmin"  # superadmin can also add subadmin
+                role = "subadmin" if not is_main_admin(uid) else "subadmin"
                 ok = await run(db_add_admin, tid, role)
                 reply = f"✅ `{tid}` added as Subadmin." if ok else f"ℹ️ `{tid}` is already an admin/subadmin."
         except ValueError:
@@ -1155,7 +1129,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if not (is_main_admin(uid) or db_is_admin(uid)):
             await msg.reply_text("⛔ You don't have permission to manage subadmins.")
             return
-        # Show only subadmins (role='subadmin') to admin, all subadmins to superadmin
         if is_main_admin(uid):
             rows = await run(db_list_admins)  # all
             listing = "\n".join(f"• `{r['user_id']}` ({r['role'].capitalize()})" for r in rows)
